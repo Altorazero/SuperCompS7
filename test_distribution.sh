@@ -1,5 +1,5 @@
 #!/bin/bash
-# Тест демонстрации взвешенного распределения
+# Test script to demonstrate weighted workload distribution
 
 echo "=== Демонстрация взвешенного распределения данных ==="
 echo ""

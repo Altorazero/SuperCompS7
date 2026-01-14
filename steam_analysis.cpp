@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
-#include <cstring>
 
 using namespace std;
 
@@ -108,6 +107,11 @@ int getNodeWeight(const char* node_name) {
 // Возвращает true если текущий процесс должен обработать данную строку
 bool shouldProcessLine(int line_number, int rank, int world_size, 
                        const vector<int>& rank_weights, int total_weight) {
+    // Проверка на некорректные входные данные
+    if (total_weight <= 0) {
+        return false;
+    }
+    
     // Вычисляем к какому процессу относится данная строка на основе весов
     int weight_position = line_number % total_weight;
     int cumulative_weight = 0;
@@ -301,7 +305,15 @@ int main(int argc, char** argv) {
     
     // Собираем информацию о весах всех процессов
     vector<int> all_weights(world_size);
-    MPI_Allgather(&node_weight, 1, MPI_INT, all_weights.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    int mpi_result = MPI_Allgather(&node_weight, 1, MPI_INT, all_weights.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    
+    if (mpi_result != MPI_SUCCESS) {
+        if (rank == 0) {
+            cerr << "Ошибка: MPI_Allgather вернул код ошибки " << mpi_result << "\n";
+        }
+        MPI_Finalize();
+        return 1;
+    }
     
     // Вычисляем общий вес
     int total_weight = 0;
