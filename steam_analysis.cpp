@@ -9,6 +9,11 @@
 #include <cmath>
 #include <iomanip>
 
+// Поддержка CUDA (опционально)
+#ifdef USE_CUDA
+#include "cuda_accelerator.h"
+#endif
+
 using namespace std;
 
 // Константы
@@ -178,7 +183,8 @@ vector<Game> readCSV(const string& filename, int rank, int world_size,
 
 // Функция для анализа данных по платформе
 void analyzePlatform(const vector<Game>& games, const string& platform_name, 
-                     int rank, int world_size, ofstream& outfile, ofstream& csvfile) {
+                     int rank, int world_size, ofstream& outfile, ofstream& csvfile, 
+                     bool use_cuda) {
     
     // Фильтруем игры по платформе
     vector<Game> platform_games;
@@ -207,17 +213,65 @@ void analyzePlatform(const vector<Game>& games, const string& platform_name,
         stats.game_count++;
         stats.total_dlc += game.dlc_count;
         
-        // Вычисляем отношение положительных к отрицательным отзывам
+        // Сохраняем данные для потенциальной обработки на GPU
         if (game.positive > 0 || game.negative > 0) {
-            double ratio = 0.0;
-            if (game.negative > 0) {
-                ratio = static_cast<double>(game.positive) / static_cast<double>(game.negative);
-            } else if (game.positive > 0) {
-                ratio = static_cast<double>(game.positive);
+            // Для CPU-версии вычисляем сразу
+            if (!use_cuda) {
+                double ratio = 0.0;
+                if (game.negative > 0) {
+                    ratio = static_cast<double>(game.positive) / static_cast<double>(game.negative);
+                } else if (game.positive > 0) {
+                    ratio = static_cast<double>(game.positive);
+                }
+                stats.review_ratios.push_back(ratio);
+            } else {
+                // Для GPU-версии сохраняем исходные данные
+                stats.review_ratios.push_back(game.positive); // временно используем для positive
+                stats.review_ratios.push_back(game.negative);  // следующий элемент - negative
             }
-            stats.review_ratios.push_back(ratio);
         }
     }
+    
+#ifdef USE_CUDA
+    // Если используется CUDA, обрабатываем review ratios на GPU
+    if (use_cuda) {
+        for (auto& price_group : price_groups) {
+            for (auto& pub_pair : price_group.second) {
+                auto& stats = pub_pair.second;
+                if (stats.review_ratios.size() >= 2) {
+                    int count = stats.review_ratios.size() / 2;
+                    vector<int> positive_vals(count);
+                    vector<int> negative_vals(count);
+                    vector<double> ratios(count);
+                    
+                    // Разделяем positive и negative
+                    for (int i = 0; i < count; i++) {
+                        positive_vals[i] = static_cast<int>(stats.review_ratios[i * 2]);
+                        negative_vals[i] = static_cast<int>(stats.review_ratios[i * 2 + 1]);
+                    }
+                    
+                    // Вычисляем на GPU
+                    if (cuda_calculate_review_ratios(positive_vals.data(), negative_vals.data(), 
+                                                     ratios.data(), count)) {
+                        stats.review_ratios = ratios;
+                    } else {
+                        // Fallback на CPU если CUDA не сработала
+                        stats.review_ratios.clear();
+                        for (int i = 0; i < count; i++) {
+                            double ratio = 0.0;
+                            if (negative_vals[i] > 0) {
+                                ratio = static_cast<double>(positive_vals[i]) / static_cast<double>(negative_vals[i]);
+                            } else if (positive_vals[i] > 0) {
+                                ratio = static_cast<double>(positive_vals[i]);
+                            }
+                            stats.review_ratios.push_back(ratio);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
     
     // Для каждого ценового интервала находим топ-5 издателей
     if (rank == 0) {
@@ -234,11 +288,23 @@ void analyzePlatform(const vector<Game>& games, const string& platform_name,
         for (auto& pub_pair : publishers) {
             auto& stats = pub_pair.second;
             if (!stats.review_ratios.empty()) {
-                double sum = 0.0;
-                for (double ratio : stats.review_ratios) {
-                    sum += ratio;
+#ifdef USE_CUDA
+                // Используем CUDA для вычисления среднего на GPU узлах
+                if (use_cuda && stats.review_ratios.size() > 10) {
+                    stats.avg_review_ratio = cuda_calculate_average(
+                        stats.review_ratios.data(), stats.review_ratios.size()
+                    );
+                } else {
+#endif
+                    // CPU версия
+                    double sum = 0.0;
+                    for (double ratio : stats.review_ratios) {
+                        sum += ratio;
+                    }
+                    stats.avg_review_ratio = sum / stats.review_ratios.size();
+#ifdef USE_CUDA
                 }
-                stats.avg_review_ratio = sum / stats.review_ratios.size();
+#endif
             }
         }
         
@@ -311,6 +377,19 @@ int main(int argc, char** argv) {
     // Определяем тип узла и его вес
     bool has_gpu = isGPUNode(node_name);
     int node_weight = getNodeWeight(node_name);
+    
+    // Инициализация CUDA на GPU узлах
+    bool use_cuda = false;
+#ifdef USE_CUDA
+    if (has_gpu) {
+        use_cuda = cuda_initialize();
+        if (use_cuda) {
+            cout << "Процесс " << rank << ": CUDA инициализирована успешно\n";
+        } else {
+            cout << "Процесс " << rank << ": CUDA недоступна, используется CPU режим\n";
+        }
+    }
+#endif
     
     // Собираем информацию о весах всех процессов
     vector<int> all_weights(world_size);
@@ -412,13 +491,13 @@ int main(int argc, char** argv) {
     }
     
     // Анализируем данные по каждой платформе
-    analyzePlatform(local_games, "Windows", rank, world_size, outfile, csvfile);
+    analyzePlatform(local_games, "Windows", rank, world_size, outfile, csvfile, use_cuda);
     MPI_Barrier(MPI_COMM_WORLD);
     
-    analyzePlatform(local_games, "Mac", rank, world_size, outfile, csvfile);
+    analyzePlatform(local_games, "Mac", rank, world_size, outfile, csvfile, use_cuda);
     MPI_Barrier(MPI_COMM_WORLD);
     
-    analyzePlatform(local_games, "Linux", rank, world_size, outfile, csvfile);
+    analyzePlatform(local_games, "Linux", rank, world_size, outfile, csvfile, use_cuda);
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (rank == 0) {
@@ -433,6 +512,13 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         cout << "Время выполнения: " << (end_time - start_time) << " секунд\n";
     }
+    
+#ifdef USE_CUDA
+    // Очистка CUDA ресурсов на GPU узлах
+    if (use_cuda) {
+        cuda_cleanup();
+    }
+#endif
     
     MPI_Finalize();
     return 0;
