@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <cstring>
 
 using namespace std;
 
@@ -15,6 +16,8 @@ using namespace std;
 const int MIN_CSV_FIELDS = 34;        // Минимальное количество полей в CSV
 const double PRICE_INTERVAL_SIZE = 5.0; // Размер ценового интервала в долларах
 const int MAX_TOP_PUBLISHERS = 5;     // Количество топ издателей для вывода
+const int GPU_WEIGHT = 3;              // Вес GPU узла (в 3 раза мощнее CPU)
+const int CPU_WEIGHT = 1;              // Вес CPU узла
 
 // Структура для хранения данных об игре
 struct Game {
@@ -89,8 +92,39 @@ int safeStoi(const string& str) {
     }
 }
 
-// Функция для чтения и парсинга CSV файла
-vector<Game> readCSV(const string& filename, int rank, int world_size) {
+// Функция для определения типа узла (GPU или CPU)
+bool isGPUNode(const char* node_name) {
+    // Проверяем по имени узла
+    string name(node_name);
+    return (name.find("gpu") != string::npos || name.find("GPU") != string::npos);
+}
+
+// Функция для получения веса узла
+int getNodeWeight(const char* node_name) {
+    return isGPUNode(node_name) ? GPU_WEIGHT : CPU_WEIGHT;
+}
+
+// Функция для вычисления взвешенного распределения строк
+// Возвращает true если текущий процесс должен обработать данную строку
+bool shouldProcessLine(int line_number, int rank, int world_size, 
+                       const vector<int>& rank_weights, int total_weight) {
+    // Вычисляем к какому процессу относится данная строка на основе весов
+    int weight_position = line_number % total_weight;
+    int cumulative_weight = 0;
+    
+    for (int r = 0; r < world_size; r++) {
+        cumulative_weight += rank_weights[r];
+        if (weight_position < cumulative_weight) {
+            return (r == rank);
+        }
+    }
+    
+    return false;
+}
+
+// Функция для чтения и парсинга CSV файла с учетом весов узлов
+vector<Game> readCSV(const string& filename, int rank, int world_size,
+                     const vector<int>& rank_weights, int total_weight) {
     vector<Game> games;
     ifstream file(filename);
     
@@ -107,8 +141,8 @@ vector<Game> readCSV(const string& filename, int rank, int world_size) {
     
     int line_number = 0;
     while (getline(file, line)) {
-        // Распределяем строки между процессами
-        if (line_number % world_size != rank) {
+        // Распределяем строки между процессами с учетом весов
+        if (!shouldProcessLine(line_number, rank, world_size, rank_weights, total_weight)) {
             line_number++;
             continue;
         }
@@ -261,9 +295,35 @@ int main(int argc, char** argv) {
     int name_len;
     MPI_Get_processor_name(node_name, &name_len);
     
+    // Определяем тип узла и его вес
+    bool has_gpu = isGPUNode(node_name);
+    int node_weight = getNodeWeight(node_name);
+    
+    // Собираем информацию о весах всех процессов
+    vector<int> all_weights(world_size);
+    MPI_Allgather(&node_weight, 1, MPI_INT, all_weights.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    
+    // Вычисляем общий вес
+    int total_weight = 0;
+    for (int w : all_weights) {
+        total_weight += w;
+    }
+    
     if (rank == 0) {
-        cout << "Запуск анализа Steam игр с использованием MPI\n";
+        cout << "Запуск анализа Steam игр с использованием MPI и GPU ускорения\n";
         cout << "Количество процессов: " << world_size << "\n";
+        cout << "Общий вычислительный вес: " << total_weight << "\n";
+        cout << "\nРаспределение по узлам:\n";
+    }
+    
+    // Все процессы выводят информацию о себе
+    for (int i = 0; i < world_size; i++) {
+        if (rank == i) {
+            cout << "  Процесс " << rank << " на узле " << node_name 
+                 << " (тип: " << (has_gpu ? "GPU" : "CPU") 
+                 << ", вес: " << node_weight << ")\n";
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
     }
     
     // Проверяем аргументы командной строки
@@ -273,18 +333,26 @@ int main(int argc, char** argv) {
     }
     
     if (rank == 0) {
-        cout << "Чтение файла: " << csv_filename << "\n";
+        cout << "\nЧтение файла: " << csv_filename << "\n";
     }
     
     // Засекаем время начала
     double start_time = MPI_Wtime();
     
-    // Каждый процесс читает свою часть данных
-    vector<Game> local_games = readCSV(csv_filename, rank, world_size);
+    // Каждый процесс читает свою часть данных с учетом весов
+    vector<Game> local_games = readCSV(csv_filename, rank, world_size, all_weights, total_weight);
     
     if (rank == 0) {
-        cout << "Процесс " << rank << " прочитал " << local_games.size() 
-             << " строк на узле " << node_name << "\n";
+        cout << "Данные распределены с учетом мощности узлов:\n";
+    }
+    
+    // Все процессы выводят информацию о своей загрузке
+    for (int i = 0; i < world_size; i++) {
+        if (rank == i) {
+            cout << "  Процесс " << rank << " (" << (has_gpu ? "GPU" : "CPU") 
+                 << ") обработал " << local_games.size() << " строк\n";
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
     }
     
     // Собираем данные со всех процессов на главном
@@ -293,7 +361,7 @@ int main(int argc, char** argv) {
     MPI_Reduce(&local_count, &total_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        cout << "Всего прочитано игр: " << total_count << "\n";
+        cout << "\nВсего прочитано игр: " << total_count << "\n";
         cout << "Начинаем анализ...\n";
     }
     
