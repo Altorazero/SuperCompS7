@@ -178,7 +178,7 @@ vector<Game> readCSV(const string& filename, int rank, int world_size,
 
 // Функция для анализа данных по платформе
 void analyzePlatform(const vector<Game>& games, const string& platform_name, 
-                     int rank, int world_size, ofstream& outfile) {
+                     int rank, int world_size, ofstream& outfile, ofstream& csvfile) {
     
     // Фильтруем игры по платформе
     vector<Game> platform_games;
@@ -279,6 +279,15 @@ void analyzePlatform(const vector<Game>& games, const string& platform_name,
                         << fixed << setprecision(2) << stats.avg_review_ratio << "\n";
                 outfile << "\n";
                 
+                // Выводим в CSV формате
+                csvfile << platform_name << ","
+                       << (interval * static_cast<int>(PRICE_INTERVAL_SIZE)) << ","
+                       << ((interval + 1) * static_cast<int>(PRICE_INTERVAL_SIZE)) << ","
+                       << "\"" << stats.name << "\","
+                       << stats.game_count << ","
+                       << fixed << setprecision(2) << dlc_ratio << ","
+                       << fixed << setprecision(2) << stats.avg_review_ratio << "\n";
+                
                 count++;
             }
         }
@@ -377,8 +386,9 @@ int main(int argc, char** argv) {
         cout << "Начинаем анализ...\n";
     }
     
-    // Открываем выходной файл только на главном процессе
+    // Открываем выходные файлы только на главном процессе
     ofstream outfile;
+    ofstream csvfile;
     if (rank == 0) {
         outfile.open("analysis_results.txt");
         if (!outfile.is_open()) {
@@ -387,23 +397,34 @@ int main(int argc, char** argv) {
             return 1;
         }
         
+        csvfile.open("analysis_results.csv");
+        if (!csvfile.is_open()) {
+            cerr << "Ошибка: не удалось создать CSV файл результатов\n";
+            MPI_Finalize();
+            return 1;
+        }
+        
         outfile << "Результаты анализа игр Steam\n";
         outfile << "========================================\n";
+        
+        // Записываем заголовок CSV
+        csvfile << "Платформа,Цена_мин,Цена_макс,Издатель,Количество_игр,DLC_на_игру,Отношение_отзывов\n";
     }
     
     // Анализируем данные по каждой платформе
-    analyzePlatform(local_games, "Windows", rank, world_size, outfile);
+    analyzePlatform(local_games, "Windows", rank, world_size, outfile, csvfile);
     MPI_Barrier(MPI_COMM_WORLD);
     
-    analyzePlatform(local_games, "Mac", rank, world_size, outfile);
+    analyzePlatform(local_games, "Mac", rank, world_size, outfile, csvfile);
     MPI_Barrier(MPI_COMM_WORLD);
     
-    analyzePlatform(local_games, "Linux", rank, world_size, outfile);
+    analyzePlatform(local_games, "Linux", rank, world_size, outfile, csvfile);
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (rank == 0) {
         outfile.close();
-        cout << "Анализ завершен. Результаты сохранены в analysis_results.txt\n";
+        csvfile.close();
+        cout << "Анализ завершен. Результаты сохранены в analysis_results.txt и analysis_results.csv\n";
     }
     
     // Засекаем время окончания

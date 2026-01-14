@@ -11,7 +11,7 @@ $(TARGET): $(SOURCE)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCE)
 
 clean:
-	rm -f $(TARGET) *.o steam_analysis.out steam_analysis.err analysis_results.txt
+	rm -f $(TARGET) *.o steam_analysis.out steam_analysis.err analysis_results.txt analysis_results.csv
 
 install:
 	cp $(TARGET) /mnt/share/
