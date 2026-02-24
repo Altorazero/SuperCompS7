@@ -9,12 +9,19 @@
 #include <cmath>
 #include <iomanip>
 
+// Поддержка CUDA (опционально)
+#ifdef USE_CUDA
+#include "cuda_accelerator.h"
+#endif
+
 using namespace std;
 
 // Константы
 const int MIN_CSV_FIELDS = 34;        // Минимальное количество полей в CSV
 const double PRICE_INTERVAL_SIZE = 5.0; // Размер ценового интервала в долларах
 const int MAX_TOP_PUBLISHERS = 5;     // Количество топ издателей для вывода
+const int GPU_WEIGHT = 3;              // Вес GPU узла (в 3 раза мощнее CPU)
+const int CPU_WEIGHT = 1;              // Вес CPU узла
 
 // Структура для хранения данных об игре
 struct Game {
@@ -89,8 +96,44 @@ int safeStoi(const string& str) {
     }
 }
 
-// Функция для чтения и парсинга CSV файла
-vector<Game> readCSV(const string& filename, int rank, int world_size) {
+// Функция для определения типа узла (GPU или CPU)
+bool isGPUNode(const char* node_name) {
+    // Проверяем по имени узла
+    string name(node_name);
+    return (name.find("gpu") != string::npos || name.find("GPU") != string::npos);
+}
+
+// Функция для получения веса узла
+int getNodeWeight(const char* node_name) {
+    return isGPUNode(node_name) ? GPU_WEIGHT : CPU_WEIGHT;
+}
+
+// Функция для вычисления взвешенного распределения строк
+// Возвращает true если текущий процесс должен обработать данную строку
+bool shouldProcessLine(int line_number, int rank, int world_size, 
+                       const vector<int>& rank_weights, int total_weight) {
+    // Проверка на некорректные входные данные
+    if (total_weight <= 0) {
+        return false;
+    }
+    
+    // Вычисляем к какому процессу относится данная строка на основе весов
+    int weight_position = line_number % total_weight;
+    int cumulative_weight = 0;
+    
+    for (int r = 0; r < world_size; r++) {
+        cumulative_weight += rank_weights[r];
+        if (weight_position < cumulative_weight) {
+            return (r == rank);
+        }
+    }
+    
+    return false;
+}
+
+// Функция для чтения и парсинга CSV файла с учетом весов узлов
+vector<Game> readCSV(const string& filename, int rank, int world_size,
+                     const vector<int>& rank_weights, int total_weight) {
     vector<Game> games;
     ifstream file(filename);
     
@@ -107,8 +150,8 @@ vector<Game> readCSV(const string& filename, int rank, int world_size) {
     
     int line_number = 0;
     while (getline(file, line)) {
-        // Распределяем строки между процессами
-        if (line_number % world_size != rank) {
+        // Распределяем строки между процессами с учетом весов
+        if (!shouldProcessLine(line_number, rank, world_size, rank_weights, total_weight)) {
             line_number++;
             continue;
         }
@@ -140,7 +183,8 @@ vector<Game> readCSV(const string& filename, int rank, int world_size) {
 
 // Функция для анализа данных по платформе
 void analyzePlatform(const vector<Game>& games, const string& platform_name, 
-                     int rank, int world_size, ofstream& outfile) {
+                     int rank, int world_size, ofstream& outfile, ofstream& csvfile, 
+                     bool use_cuda) {
     
     // Фильтруем игры по платформе
     vector<Game> platform_games;
@@ -169,17 +213,65 @@ void analyzePlatform(const vector<Game>& games, const string& platform_name,
         stats.game_count++;
         stats.total_dlc += game.dlc_count;
         
-        // Вычисляем отношение положительных к отрицательным отзывам
+        // Сохраняем данные для потенциальной обработки на GPU
         if (game.positive > 0 || game.negative > 0) {
-            double ratio = 0.0;
-            if (game.negative > 0) {
-                ratio = static_cast<double>(game.positive) / static_cast<double>(game.negative);
-            } else if (game.positive > 0) {
-                ratio = static_cast<double>(game.positive);
+            // Для CPU-версии вычисляем сразу
+            if (!use_cuda) {
+                double ratio = 0.0;
+                if (game.negative > 0) {
+                    ratio = static_cast<double>(game.positive) / static_cast<double>(game.negative);
+                } else if (game.positive > 0) {
+                    ratio = static_cast<double>(game.positive);
+                }
+                stats.review_ratios.push_back(ratio);
+            } else {
+                // Для GPU-версии сохраняем исходные данные
+                stats.review_ratios.push_back(game.positive); // временно используем для positive
+                stats.review_ratios.push_back(game.negative);  // следующий элемент - negative
             }
-            stats.review_ratios.push_back(ratio);
         }
     }
+    
+#ifdef USE_CUDA
+    // Если используется CUDA, обрабатываем review ratios на GPU
+    if (use_cuda) {
+        for (auto& price_group : price_groups) {
+            for (auto& pub_pair : price_group.second) {
+                auto& stats = pub_pair.second;
+                if (stats.review_ratios.size() >= 2) {
+                    int count = stats.review_ratios.size() / 2;
+                    vector<int> positive_vals(count);
+                    vector<int> negative_vals(count);
+                    vector<double> ratios(count);
+                    
+                    // Разделяем positive и negative
+                    for (int i = 0; i < count; i++) {
+                        positive_vals[i] = static_cast<int>(stats.review_ratios[i * 2]);
+                        negative_vals[i] = static_cast<int>(stats.review_ratios[i * 2 + 1]);
+                    }
+                    
+                    // Вычисляем на GPU
+                    if (cuda_calculate_review_ratios(positive_vals.data(), negative_vals.data(), 
+                                                     ratios.data(), count)) {
+                        stats.review_ratios = ratios;
+                    } else {
+                        // Fallback на CPU если CUDA не сработала
+                        stats.review_ratios.clear();
+                        for (int i = 0; i < count; i++) {
+                            double ratio = 0.0;
+                            if (negative_vals[i] > 0) {
+                                ratio = static_cast<double>(positive_vals[i]) / static_cast<double>(negative_vals[i]);
+                            } else if (positive_vals[i] > 0) {
+                                ratio = static_cast<double>(positive_vals[i]);
+                            }
+                            stats.review_ratios.push_back(ratio);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
     
     // Для каждого ценового интервала находим топ-5 издателей
     if (rank == 0) {
@@ -196,11 +288,23 @@ void analyzePlatform(const vector<Game>& games, const string& platform_name,
         for (auto& pub_pair : publishers) {
             auto& stats = pub_pair.second;
             if (!stats.review_ratios.empty()) {
-                double sum = 0.0;
-                for (double ratio : stats.review_ratios) {
-                    sum += ratio;
+#ifdef USE_CUDA
+                // Используем CUDA для вычисления среднего на GPU узлах
+                if (use_cuda && stats.review_ratios.size() > 10) {
+                    stats.avg_review_ratio = cuda_calculate_average(
+                        stats.review_ratios.data(), stats.review_ratios.size()
+                    );
+                } else {
+#endif
+                    // CPU версия
+                    double sum = 0.0;
+                    for (double ratio : stats.review_ratios) {
+                        sum += ratio;
+                    }
+                    stats.avg_review_ratio = sum / stats.review_ratios.size();
+#ifdef USE_CUDA
                 }
-                stats.avg_review_ratio = sum / stats.review_ratios.size();
+#endif
             }
         }
         
@@ -241,6 +345,15 @@ void analyzePlatform(const vector<Game>& games, const string& platform_name,
                         << fixed << setprecision(2) << stats.avg_review_ratio << "\n";
                 outfile << "\n";
                 
+                // Выводим в CSV формате
+                csvfile << platform_name << ","
+                       << (interval * static_cast<int>(PRICE_INTERVAL_SIZE)) << ","
+                       << ((interval + 1) * static_cast<int>(PRICE_INTERVAL_SIZE)) << ","
+                       << "\"" << stats.name << "\","
+                       << stats.game_count << ","
+                       << fixed << setprecision(2) << dlc_ratio << ","
+                       << fixed << setprecision(2) << stats.avg_review_ratio << "\n";
+                
                 count++;
             }
         }
@@ -261,9 +374,56 @@ int main(int argc, char** argv) {
     int name_len;
     MPI_Get_processor_name(node_name, &name_len);
     
+    // Определяем тип узла и его вес
+    bool has_gpu = isGPUNode(node_name);
+    int node_weight = getNodeWeight(node_name);
+    
+    // Инициализация CUDA на GPU узлах
+    bool use_cuda = false;
+#ifdef USE_CUDA
+    if (has_gpu) {
+        use_cuda = cuda_initialize();
+        if (use_cuda) {
+            cout << "Процесс " << rank << ": CUDA инициализирована успешно\n";
+        } else {
+            cout << "Процесс " << rank << ": CUDA недоступна, используется CPU режим\n";
+        }
+    }
+#endif
+    
+    // Собираем информацию о весах всех процессов
+    vector<int> all_weights(world_size);
+    int mpi_result = MPI_Allgather(&node_weight, 1, MPI_INT, all_weights.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    
+    if (mpi_result != MPI_SUCCESS) {
+        if (rank == 0) {
+            cerr << "Ошибка: MPI_Allgather вернул код ошибки " << mpi_result << "\n";
+        }
+        MPI_Finalize();
+        return 1;
+    }
+    
+    // Вычисляем общий вес
+    int total_weight = 0;
+    for (int w : all_weights) {
+        total_weight += w;
+    }
+    
     if (rank == 0) {
-        cout << "Запуск анализа Steam игр с использованием MPI\n";
+        cout << "Запуск анализа Steam игр с использованием MPI и GPU ускорения\n";
         cout << "Количество процессов: " << world_size << "\n";
+        cout << "Общий вычислительный вес: " << total_weight << "\n";
+        cout << "\nРаспределение по узлам:\n";
+    }
+    
+    // Все процессы выводят информацию о себе
+    for (int i = 0; i < world_size; i++) {
+        if (rank == i) {
+            cout << "  Процесс " << rank << " на узле " << node_name 
+                 << " (тип: " << (has_gpu ? "GPU" : "CPU") 
+                 << ", вес: " << node_weight << ")\n";
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
     }
     
     // Проверяем аргументы командной строки
@@ -273,18 +433,26 @@ int main(int argc, char** argv) {
     }
     
     if (rank == 0) {
-        cout << "Чтение файла: " << csv_filename << "\n";
+        cout << "\nЧтение файла: " << csv_filename << "\n";
     }
     
     // Засекаем время начала
     double start_time = MPI_Wtime();
     
-    // Каждый процесс читает свою часть данных
-    vector<Game> local_games = readCSV(csv_filename, rank, world_size);
+    // Каждый процесс читает свою часть данных с учетом весов
+    vector<Game> local_games = readCSV(csv_filename, rank, world_size, all_weights, total_weight);
     
     if (rank == 0) {
-        cout << "Процесс " << rank << " прочитал " << local_games.size() 
-             << " строк на узле " << node_name << "\n";
+        cout << "Данные распределены с учетом мощности узлов:\n";
+    }
+    
+    // Все процессы выводят информацию о своей загрузке
+    for (int i = 0; i < world_size; i++) {
+        if (rank == i) {
+            cout << "  Процесс " << rank << " (" << (has_gpu ? "GPU" : "CPU") 
+                 << ") обработал " << local_games.size() << " строк\n";
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
     }
     
     // Собираем данные со всех процессов на главном
@@ -293,12 +461,13 @@ int main(int argc, char** argv) {
     MPI_Reduce(&local_count, &total_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        cout << "Всего прочитано игр: " << total_count << "\n";
+        cout << "\nВсего прочитано игр: " << total_count << "\n";
         cout << "Начинаем анализ...\n";
     }
     
-    // Открываем выходной файл только на главном процессе
+    // Открываем выходные файлы только на главном процессе
     ofstream outfile;
+    ofstream csvfile;
     if (rank == 0) {
         outfile.open("analysis_results.txt");
         if (!outfile.is_open()) {
@@ -307,23 +476,34 @@ int main(int argc, char** argv) {
             return 1;
         }
         
+        csvfile.open("analysis_results.csv");
+        if (!csvfile.is_open()) {
+            cerr << "Ошибка: не удалось создать CSV файл результатов\n";
+            MPI_Finalize();
+            return 1;
+        }
+        
         outfile << "Результаты анализа игр Steam\n";
         outfile << "========================================\n";
+        
+        // Записываем заголовок CSV
+        csvfile << "Платформа,Цена_мин,Цена_макс,Издатель,Количество_игр,DLC_на_игру,Отношение_отзывов\n";
     }
     
     // Анализируем данные по каждой платформе
-    analyzePlatform(local_games, "Windows", rank, world_size, outfile);
+    analyzePlatform(local_games, "Windows", rank, world_size, outfile, csvfile, use_cuda);
     MPI_Barrier(MPI_COMM_WORLD);
     
-    analyzePlatform(local_games, "Mac", rank, world_size, outfile);
+    analyzePlatform(local_games, "Mac", rank, world_size, outfile, csvfile, use_cuda);
     MPI_Barrier(MPI_COMM_WORLD);
     
-    analyzePlatform(local_games, "Linux", rank, world_size, outfile);
+    analyzePlatform(local_games, "Linux", rank, world_size, outfile, csvfile, use_cuda);
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (rank == 0) {
         outfile.close();
-        cout << "Анализ завершен. Результаты сохранены в analysis_results.txt\n";
+        csvfile.close();
+        cout << "Анализ завершен. Результаты сохранены в analysis_results.txt и analysis_results.csv\n";
     }
     
     // Засекаем время окончания
@@ -332,6 +512,13 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         cout << "Время выполнения: " << (end_time - start_time) << " секунд\n";
     }
+    
+#ifdef USE_CUDA
+    // Очистка CUDA ресурсов на GPU узлах
+    if (use_cuda) {
+        cuda_cleanup();
+    }
+#endif
     
     MPI_Finalize();
     return 0;
